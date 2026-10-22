@@ -1,0 +1,114 @@
+name: 📥 دانلود فایل و انتشار در Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      download_url:
+        description: '🔗 لینک مستقیم فایل برای دانلود'
+        required: true
+        type: string
+      tag_name:
+        description: '🏷️ تگ ریلیز (اختیاری — اگر خالی باشد خودکار ساخته می‌شود)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download-and-release:
+    name: دانلود و انتشار
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # برای ساخت ریلیز و آپلود فایل لازم است
+
+    steps:
+      - name: 📥 دانلود فایل با نمایش نوار پیشرفت و درصد
+        run: |
+          set -e
+
+          URL="${{ inputs.download_url }}"
+          # حذف query string از انتهای لینک و استخراج نام فایل
+          FILENAME="$(basename "${URL%%\?*}")"
+          [ -z "$FILENAME" ] && FILENAME="downloaded_file"
+          echo "FILENAME=$FILENAME" >> "$GITHUB_ENV"
+
+          echo "🔗 لینک: $URL"
+          echo "📄 نام فایل: $FILENAME"
+          echo ""
+
+          # دریافت حجم فایل (با دنبال‌کردن redirect ها)
+          SIZE=$(curl -sIL "$URL" | awk 'BEGIN{IGNORECASE=1} /^content-length:/ {n=$2} END {n=int(n); if (n>0) print n}')
+
+          if [ -n "$SIZE" ]; then
+            SIZE_MB=$(( SIZE / 1048576 ))
+            echo "📦 حجم فایل: ${SIZE_MB} MB"
+
+            # دانلود در پس‌زمینه تا بتوانیم پیشرفت را نمایش دهیم
+            curl -sL --retry 3 -o "$FILENAME" "$URL" &
+            CURL_PID=$!
+
+            LAST_PERCENT=-1
+            while kill -0 $CURL_PID 2>/dev/null; do
+              CURRENT=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
+              PERCENT=$(( CURRENT * 100 / SIZE ))
+              if [ "$PERCENT" != "$LAST_PERCENT" ]; then
+                FILLED=$(( PERCENT / 2 ))
+                BAR=$(printf '%*s' "$FILLED" '' | tr ' ' '█')
+                EMPTY=$(printf '%*s' "$((50 - FILLED))" '' | tr ' ' '░')
+                CUR_MB=$(( CURRENT / 1048576 ))
+                printf '\r|%s%s| %3d%%  (%d/%d MB)' "$BAR" "$EMPTY" "$PERCENT" "$CUR_MB" "$SIZE_MB"
+                LAST_PERCENT=$PERCENT
+              fi
+              sleep 1
+            done
+
+            RC=0
+            wait $CURL_PID || RC=$?
+            echo ""
+            if [ "$RC" -ne 0 ]; then
+              echo "❌ دانلود ناموفق بود (کد خطا: $RC)"
+              exit "$RC"
+            fi
+          else
+            # اگر سرور حجم فایل را اعلام نکرد، از نوار پیشرفت داخلی curl استفاده می‌کنیم
+            echo "⚠️ حجم فایل مشخص نیست؛ دانلود با نوار پیشرفت ساده..."
+            curl -L --retry 3 --progress-bar -o "$FILENAME" "$URL"
+          fi
+
+          echo ""
+          echo "✅ دانلود با موفقیت انجام شد:"
+          ls -lh "$FILENAME"
+          echo ""
+          echo "🔐 SHA256:"
+          sha256sum "$FILENAME"
+
+      - name: 🏷️ تعیین تگ ریلیز
+        id: tag
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          if [ -z "$TAG" ]; then
+            TAG="v1.0.${{ github.run_number }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "🏷️ تگ ریلیز: $TAG"
+
+      - name: 🚀 ساخت ریلیز و آپلود فایل به آن
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Release ${{ steps.tag.outputs.tag }}
+          files: ${{ env.FILENAME }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 خلاصه اجرا
+        run: |
+          {
+            echo "## ✅ عملیات با موفقیت انجام شد"
+            echo ""
+            echo "- 📄 فایل: \`${{ env.FILENAME }}\`"
+            echo "- 🏷️ تگ: \`${{ steps.tag.outputs.tag }}\`"
+            echo "- 🚀 ریلیز: ${{ steps.release.outputs.url }}"
+          } >> "$GITHUB_STEP_SUMMARY"
