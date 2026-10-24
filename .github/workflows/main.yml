@@ -1,4 +1,4 @@
-name: 📥 دانلود فایل و انتشار در Release
+name: 📥 دانلود، تبدیل به MP4 و انتشار در Release
 
 on:
   workflow_dispatch:
@@ -14,8 +14,8 @@ on:
         default: ''
 
 jobs:
-  download-and-release:
-    name: دانلود و انتشار
+  download-convert-release:
+    name: دانلود، تبدیل و انتشار
     runs-on: ubuntu-latest
     permissions:
       contents: write   # برای ساخت ریلیز و آپلود فایل لازم است
@@ -77,9 +77,120 @@ jobs:
           echo ""
           echo "✅ دانلود با موفقیت انجام شد:"
           ls -lh "$FILENAME"
+
+      - name: 🎬 تبدیل به MP4 در صورت نیاز (با نوار پیشرفت)
+        run: |
+          set -e
+          set -o pipefail
+
+          EXT="${FILENAME##*.}"
+          EXT_LOWER=$(echo "$EXT" | tr '[:upper:]' '[:lower:]')
+          VIDEO_EXTS="mp4 mkv avi mov webm wmv flv m4v mpg mpeg ts mts m2ts 3gp vob ogv rm rmvb divx asf"
+
+          IS_VIDEO=false
+          if [ "$EXT" != "$FILENAME" ]; then
+            for e in $VIDEO_EXTS; do
+              [ "$e" = "$EXT_LOWER" ] && IS_VIDEO=true && break
+            done
+          fi
+
+          # فایل غیر ویدیویی → همان فایل اصلی ریلیز می‌شود
+          if [ "$IS_VIDEO" = false ]; then
+            echo "ℹ️ فایل ویدیویی نیست (پسوند: .$EXT_LOWER) — بدون تغییر ریلیز می‌شود."
+            echo "RELEASE_FILE=$FILENAME" >> "$GITHUB_ENV"
+            echo "CONVERTED=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # فایل از قبل MP4 است → نیازی به تبدیل نیست
+          if [ "$EXT_LOWER" = "mp4" ]; then
+            echo "✅ فایل از قبل MP4 است — نیازی به تبدیل نیست."
+            echo "RELEASE_FILE=$FILENAME" >> "$GITHUB_ENV"
+            echo "CONVERTED=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # نصب ffmpeg در صورت نیاز
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            echo "📦 نصب ffmpeg..."
+            sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          fi
+          ffmpeg -version | head -n 1
+
+          OUTPUT="${FILENAME%.*}.mp4"
+          echo "RELEASE_FILE=$OUTPUT" >> "$GITHUB_ENV"
+          echo "CONVERTED=true" >> "$GITHUB_ENV"
+
+          # مدت زمان ویدیو (به میکروثانیه) برای محاسبه درصد
+          TOTAL_US=$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$FILENAME" | awk '{printf "%d", $1*1000000}')
+          [ -z "$TOTAL_US" ] && TOTAL_US=0
+          echo "⏱️ مدت زمان ویدیو: $(( TOTAL_US / 1000000 )) ثانیه"
+
+          # اجرای ffmpeg با نمایش نوار پیشرفت و درصد
+          # آرگومان‌های کدک به‌صورت "$@" به تابع داده می‌شوند
+          run_ffmpeg () {
+            local last=-1
+            ffmpeg -y -hide_banner -i "$FILENAME" "$@" -movflags +faststart \
+              -progress pipe:1 -nostats "$OUTPUT" 2>.ffmpeg_log.txt | \
+            while IFS='=' read -r key value; do
+              case "$key" in
+                out_time_ms|out_time_us)
+                  [[ "$value" =~ ^-?[0-9]+$ ]] || continue
+                  [ "$value" -lt 0 ] && value=0
+                  if [ "$TOTAL_US" -gt 0 ]; then
+                    local percent=$(( value * 100 / TOTAL_US ))
+                    [ "$percent" -gt 100 ] && percent=100
+                    if [ "$percent" != "$last" ]; then
+                      local filled=$(( percent / 2 ))
+                      local bar empty
+                      bar=$(printf '%*s' "$filled" '' | tr ' ' '█')
+                      empty=$(printf '%*s' "$((50 - filled))" '' | tr ' ' '░')
+                      printf '\r🎬 تبدیل: |%s%s| %3d%%' "$bar" "$empty" "$percent"
+                      last=$percent
+                    fi
+                  else
+                    local secs=$(( value / 1000000 ))
+                    if [ "$secs" != "$last" ]; then
+                      printf '\r🎬 تبدیل: ⏳ %d ثانیه پردازش شد...' "$secs"
+                      last=$secs
+                    fi
+                  fi
+                  ;;
+              esac
+            done
+          }
+
           echo ""
-          echo "🔐 SHA256:"
-          sha256sum "$FILENAME"
+          # تلاش اول: Remux سریع (بدون re-encode) — اگر کدک‌ها سازگار باشند
+          echo "🎬 تلاش برای تبدیل سریع (remux)..."
+          if run_ffmpeg -c copy && [ -s "$OUTPUT" ]; then
+            echo ""
+            echo "⚡ تبدیل با remux انجام شد (بدون افت کیفیت، سریع)."
+          else
+            echo ""
+            echo "⚠️ remux ممکن نبود؛ تبدیل کامل (re-encode) آغاز می‌شود..."
+            rm -f "$OUTPUT"
+            if ! run_ffmpeg -c:v libx264 -preset fast -crf 23 -c:a aac -b:a 192k; then
+              echo ""
+              echo "❌ تبدیل ناموفق بود. خروجی ffmpeg:"
+              tail -n 30 .ffmpeg_log.txt
+              exit 1
+            fi
+          fi
+          echo ""
+
+          # بررسی نهایی و پاک‌سازی فایل اصلی برای آزاد شدن فضای دیسک
+          [ -s "$OUTPUT" ] || { echo "❌ فایل خروجی ساخته نشد."; exit 1; }
+          rm -f "$FILENAME" .ffmpeg_log.txt
+
+          echo "✅ تبدیل با موفقیت انجام شد:"
+          ls -lh "$OUTPUT"
+
+      - name: 🔐 محاسبه هش فایل نهایی
+        run: |
+          echo "🔐 SHA256 فایل ${{ env.RELEASE_FILE }}:"
+          sha256sum "${{ env.RELEASE_FILE }}"
 
       - name: 🏷️ تعیین تگ ریلیز
         id: tag
@@ -97,7 +208,7 @@ jobs:
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           name: Release ${{ steps.tag.outputs.tag }}
-          files: ${{ env.FILENAME }}
+          files: ${{ env.RELEASE_FILE }}
           generate_release_notes: true
           fail_on_unmatched_files: true
         env:
@@ -108,7 +219,9 @@ jobs:
           {
             echo "## ✅ عملیات با موفقیت انجام شد"
             echo ""
-            echo "- 📄 فایل: \`${{ env.FILENAME }}\`"
+            echo "- 📥 فایل دانلودشده: \`${{ env.FILENAME }}\`"
+            echo "- 🎬 تبدیل به MP4: ${{ env.CONVERTED }}"
+            echo "- 📄 فایل ریلیزشده: \`${{ env.RELEASE_FILE }}\`"
             echo "- 🏷️ تگ: \`${{ steps.tag.outputs.tag }}\`"
             echo "- 🚀 ریلیز: ${{ steps.release.outputs.url }}"
           } >> "$GITHUB_STEP_SUMMARY"
