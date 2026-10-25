@@ -48,7 +48,8 @@ jobs:
             echo "📦 حجم فایل: ${SIZE_MB} MB"
 
             # دانلود در پس‌زمینه تا بتوانیم پیشرفت را نمایش دهیم
-            curl -sL --retry 3 -o "$FILENAME" "$URL" &
+            # --http1.1 : جلوگیری از خطای استریم HTTP/2 (کد ۹۲) در برخی سرورها
+            curl -sL --http1.1 --retry 3 --retry-all-errors -o "$FILENAME" "$URL" &
             CURL_PID=$!
 
             LAST_PERCENT=-1
@@ -68,15 +69,32 @@ jobs:
 
             RC=0
             wait $CURL_PID || RC=$?
+
+            # نمایش وضعیت نهایی (۱۰۰٪) پس از پایان دانلود
+            CURRENT=$(stat -c%s "$FILENAME" 2>/dev/null || echo 0)
+            PERCENT=$(( CURRENT * 100 / SIZE ))
+            [ "$PERCENT" -gt 100 ] && PERCENT=100
+            FILLED=$(( PERCENT / 2 ))
+            BAR=$(printf '%*s' "$FILLED" '' | tr ' ' '█')
+            EMPTY=$(printf '%*s' "$((50 - FILLED))" '' | tr ' ' '░')
+            printf '\r|%s%s| %3d%%  (%d/%d MB)' "$BAR" "$EMPTY" "$PERCENT" "$(( CURRENT / 1048576 ))" "$SIZE_MB"
             echo ""
+
+            # راستی‌آزمایی: اگر حجم فایل با حجم اعلام‌شده‌ی سرور برابر است،
+            # دانلود موفق است — حتی اگر curl به دلایلی مثل خطای استریم HTTP/2
+            # (کد ۹۲) کد خطا برگردانده باشد.
             if [ "$RC" -ne 0 ]; then
-              echo "❌ دانلود ناموفق بود (کد خطا: $RC)"
-              exit "$RC"
+              if [ "$CURRENT" -eq "$SIZE" ]; then
+                echo "⚠️ curl با کد $RC خارج شد، اما فایل کامل دانلود شده است ($CURRENT / $SIZE بایت) — ادامه می‌دهیم."
+              else
+                echo "❌ دانلود ناموفق بود (کد خطا: $RC) — $CURRENT از $SIZE بایت دریافت شد."
+                exit "$RC"
+              fi
             fi
           else
             # اگر سرور حجم فایل را اعلام نکرد، از نوار پیشرفت داخلی curl استفاده می‌کنیم
             echo "⚠️ حجم فایل مشخص نیست؛ دانلود با نوار پیشرفت ساده..."
-            curl -L --retry 3 --progress-bar -o "$FILENAME" "$URL"
+            curl -L --http1.1 --retry 3 --retry-all-errors --progress-bar -o "$FILENAME" "$URL"
           fi
 
           echo ""
